@@ -28,35 +28,15 @@ local data_field = Field.new("data.data")
 local udp_sessions = {}
 local tcp_sessions = {}
 local tcp_port_map = {}
-local pending_tcp_by_port = {}
-
-local retained_state = {
-    udp_sessions = {},
-    tcp_sessions = {},
-    tcp_port_map = {}
-}
 
 local function clear_state()
     udp_sessions = {}
     tcp_sessions = {}
     tcp_port_map = {}
-    pending_tcp_by_port = {}
 end
 
 function flow_proto.init()
     clear_state()
-
-    for key, value in pairs(retained_state.udp_sessions) do
-        udp_sessions[key] = value
-    end
-
-    for key, value in pairs(retained_state.tcp_sessions) do
-        tcp_sessions[key] = value
-    end
-
-    for key, value in pairs(retained_state.tcp_port_map) do
-        tcp_port_map[key] = value
-    end
 end
 
 local function normalise_session(proto, src, sport, dst, dport)
@@ -117,23 +97,11 @@ function flow_proto.dissector(tvb, pinfo, tree)
                 flow_id = parsed_id
                 source = "udp metadata"
                 udp_sessions[session_key] = parsed_id
-                retained_state.udp_sessions[session_key] = parsed_id
                 if tcp_port then
                     tcp_port_map[tcp_port] = parsed_id
-                    retained_state.tcp_port_map[tcp_port] = parsed_id
-                    local pending = pending_tcp_by_port[tcp_port]
-                    local had_pending = false
-                    if pending then
-                        for pending_session, _ in pairs(pending) do
-                            tcp_sessions[pending_session] = parsed_id
-                            retained_state.tcp_sessions[pending_session] = parsed_id
-                            had_pending = true
-                        end
-                        pending_tcp_by_port[tcp_port] = nil
-                    end
-                    if had_pending and not pinfo.visited and retap_packets then
-                        retap_packets()
-                    end
+                end
+                if retap_packets and not pinfo.visited then
+                    retap_packets()
                 end
             end
         end
@@ -154,24 +122,6 @@ function flow_proto.dissector(tvb, pinfo, tree)
             end
             if flow_id then
                 tcp_sessions[session_key] = flow_id
-                retained_state.tcp_sessions[session_key] = flow_id
-            else
-                if src_port then
-                    local bucket = pending_tcp_by_port[src_port]
-                    if not bucket then
-                        bucket = {}
-                        pending_tcp_by_port[src_port] = bucket
-                    end
-                    bucket[session_key] = true
-                end
-                if dst_port then
-                    local bucket = pending_tcp_by_port[dst_port]
-                    if not bucket then
-                        bucket = {}
-                        pending_tcp_by_port[dst_port] = bucket
-                    end
-                    bucket[session_key] = true
-                end
             end
         end
     end
@@ -189,17 +139,6 @@ function flow_proto.dissector(tvb, pinfo, tree)
             pinfo.cols.info:append(" [flow_id:" .. flow_id .. "]")
         end
     end
-end
-
-local reset_listener = Listener.new("frame", "")
-
-function reset_listener:reset()
-    retained_state = {
-        udp_sessions = {},
-        tcp_sessions = {},
-        tcp_port_map = {}
-    }
-    clear_state()
 end
 
 register_postdissector(flow_proto)

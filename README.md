@@ -24,9 +24,11 @@ both UDP and TCP conversations in Wireshark:
    and choose **Apply as Column**. Alternatively, add a new custom column in
    *Preferences → Appearance → Columns* that references the `flowid.id` field.
    Wireshark will now display the identifier for every packet that belongs to
-   the associated UDP or TCP sessions. When the metadata arrives after the
-   first packets of a conversation, the plugin briefly re-taps the capture so
-   those earlier packets immediately pick up the newly learned identifier.
+   the associated UDP or TCP sessions. Whenever the metadata appears after
+   other packets in the same conversation, the plugin simply re-taps the entire
+   capture so those earlier packets pick up the newly learned identifier. This
+   behaviour favours straightforward code over performance, so very large
+   captures may take a moment to refresh after new metadata is discovered.
 4. For convenience the plugin also appends the flow identifier to the *Info*
    column whenever a dedicated column is not configured.
 
