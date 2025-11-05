@@ -1,12 +1,14 @@
 """Generate a sample PCAP file with UDP metadata and associated TCP flows.
 
-The capture contains:
-* A UDP conversation where the first packet carries flow metadata.
-* Additional UDP packets that inherit the same flow identifier.
-* A TCP conversation whose port is referenced by the UDP metadata.
-* Extra UDP/TCP traffic without metadata to ensure the dissector ignores them.
+The capture exercises the dissector with multiple edge cases:
+* A UDP conversation where the first packet carries flow metadata ahead of TCP.
+* A TCP conversation that completes before the metadata arrives (metadata trailing TCP).
+* A flow where the metadata references the server-side TCP port instead of the client port.
+* UDP metadata that omits the ``tcp_port`` attribute and therefore applies only to UDP.
+* Additional UDP/TCP noise without metadata to ensure unrelated traffic is ignored.
 
-The UDP metadata payload uses the format expected by the Lua dissector:
+The UDP metadata payload uses the format expected by the Lua dissector::
+
     flow_id=<uuid>;tcp_port=<port>
 """
 
@@ -17,7 +19,7 @@ import struct
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 ETHERTYPE_IPv4 = 0x0800
 IP_PROTO_UDP = 17
@@ -205,22 +207,37 @@ def packet_list_to_bytes(packets: Iterable[Packet], output_path: str) -> None:
             handle.write(packet.payload)
 
 
-def build_packets(flow_id: uuid.UUID) -> List[Packet]:
+def build_packets() -> Tuple[List[Packet], Dict[str, uuid.UUID]]:
     packets: List[Packet] = []
     base_time = datetime(2024, 1, 1, 12, 0, 0)
+    flow_ids: Dict[str, uuid.UUID] = {
+        "udp_leads": uuid.uuid4(),
+        "metadata_after_tcp": uuid.uuid4(),
+        "server_port_metadata": uuid.uuid4(),
+        "udp_only": uuid.uuid4(),
+    }
 
     def ts(offset_seconds: float) -> float:
         dt = base_time + timedelta(seconds=offset_seconds)
         return dt.timestamp()
 
+    identification = 1
+
+    def next_id() -> int:
+        nonlocal identification
+        value = identification
+        identification += 1
+        return value
+
+    # --- Flow where UDP metadata precedes TCP (baseline behaviour) ---
     client_mac = mac("aa:aa:aa:aa:aa:aa")
     server_mac = mac("bb:bb:bb:bb:bb:bb")
 
-    metadata_payload = f"flow_id={flow_id};tcp_port=7000".encode()
+    metadata_payload = f"flow_id={flow_ids['udp_leads']};tcp_port=7000".encode()
     packets.append(
         Packet(
             ts(0.0),
-            build_udp_packet(client_mac, server_mac, "10.0.0.1", "10.0.0.2", 5000, 6000, metadata_payload, identification=1),
+            build_udp_packet(client_mac, server_mac, "10.0.0.1", "10.0.0.2", 5000, 6000, metadata_payload, identification=next_id()),
         )
     )
 
@@ -236,7 +253,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                     5000,
                     6000,
                     f"udp payload {index}".encode(),
-                    identification=1 + index,
+                    identification=next_id(),
                 ),
             )
         )
@@ -252,7 +269,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 6000,
                 5000,
                 b"udp response",
-                identification=10,
+                identification=next_id(),
             ),
         )
     )
@@ -274,7 +291,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 0,
                 "S",
                 b"",
-                identification=20,
+                identification=next_id(),
             ),
         )
     )
@@ -293,7 +310,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 client_seq + 1,
                 "SA",
                 b"",
-                identification=21,
+                identification=next_id(),
             ),
         )
     )
@@ -312,7 +329,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 server_seq + 1,
                 "A",
                 b"",
-                identification=22,
+                identification=next_id(),
             ),
         )
     )
@@ -334,7 +351,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 server_seq + 1,
                 "PA",
                 client_payload,
-                identification=23,
+                identification=next_id(),
             ),
         )
     )
@@ -353,7 +370,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 client_seq + 1 + len(client_payload),
                 "PA",
                 server_payload,
-                identification=24,
+                identification=next_id(),
             ),
         )
     )
@@ -372,7 +389,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 server_seq + 1 + len(server_payload),
                 "FA",
                 b"",
-                identification=25,
+                identification=next_id(),
             ),
         )
     )
@@ -391,7 +408,7 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 client_seq + 2 + len(client_payload),
                 "FA",
                 b"",
-                identification=26,
+                identification=next_id(),
             ),
         )
     )
@@ -410,47 +427,499 @@ def build_packets(flow_id: uuid.UUID) -> List[Packet]:
                 server_seq + 2 + len(server_payload),
                 "A",
                 b"",
-                identification=27,
+                identification=next_id(),
             ),
         )
     )
 
-    packets.append(
-        Packet(
-            ts(2.0),
-            build_udp_packet(
-                mac("cc:cc:cc:cc:cc:cc"),
-                mac("dd:dd:dd:dd:dd:dd"),
-                "10.0.1.1",
-                "10.0.1.2",
-                4000,
-                4001,
-                b"no metadata here",
-                identification=30,
-            ),
-        )
-    )
+    # --- Flow where TCP completes before metadata is emitted ---
+    trailing_client_mac = mac("cc:cc:cc:cc:cc:cc")
+    trailing_server_mac = mac("dd:dd:dd:dd:dd:dd")
+    trailing_client_seq = 2000
+    trailing_server_seq = 9000
 
     packets.append(
         Packet(
-            ts(2.1),
+            ts(3.0),
             build_tcp_packet(
-                mac("cc:cc:cc:cc:cc:cc"),
-                mac("dd:dd:dd:dd:dd:dd"),
-                "10.0.1.1",
-                "10.0.1.2",
-                9000,
-                9001,
-                1,
+                trailing_client_mac,
+                trailing_server_mac,
+                "10.0.2.1",
+                "10.0.2.2",
+                7100,
+                7200,
+                trailing_client_seq,
                 0,
                 "S",
                 b"",
-                identification=31,
+                identification=next_id(),
             ),
         )
     )
 
-    return packets
+    packets.append(
+        Packet(
+            ts(3.05),
+            build_tcp_packet(
+                trailing_server_mac,
+                trailing_client_mac,
+                "10.0.2.2",
+                "10.0.2.1",
+                7200,
+                7100,
+                trailing_server_seq,
+                trailing_client_seq + 1,
+                "SA",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(3.1),
+            build_tcp_packet(
+                trailing_client_mac,
+                trailing_server_mac,
+                "10.0.2.1",
+                "10.0.2.2",
+                7100,
+                7200,
+                trailing_client_seq + 1,
+                trailing_server_seq + 1,
+                "A",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(3.2),
+            build_tcp_packet(
+                trailing_client_mac,
+                trailing_server_mac,
+                "10.0.2.1",
+                "10.0.2.2",
+                7100,
+                7200,
+                trailing_client_seq + 1,
+                trailing_server_seq + 1,
+                "PA",
+                b"metadata arrives later",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(3.25),
+            build_tcp_packet(
+                trailing_server_mac,
+                trailing_client_mac,
+                "10.0.2.2",
+                "10.0.2.1",
+                7200,
+                7100,
+                trailing_server_seq + 1,
+                trailing_client_seq + 1 + len(b"metadata arrives later"),
+                "PA",
+                b"acknowledged",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(3.3),
+            build_tcp_packet(
+                trailing_client_mac,
+                trailing_server_mac,
+                "10.0.2.1",
+                "10.0.2.2",
+                7100,
+                7200,
+                trailing_client_seq + 1 + len(b"metadata arrives later"),
+                trailing_server_seq + 1 + len(b"acknowledged"),
+                "FA",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(3.35),
+            build_tcp_packet(
+                trailing_server_mac,
+                trailing_client_mac,
+                "10.0.2.2",
+                "10.0.2.1",
+                7200,
+                7100,
+                trailing_server_seq + 1 + len(b"acknowledged"),
+                trailing_client_seq + 2 + len(b"metadata arrives later"),
+                "FA",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(3.4),
+            build_tcp_packet(
+                trailing_client_mac,
+                trailing_server_mac,
+                "10.0.2.1",
+                "10.0.2.2",
+                7100,
+                7200,
+                trailing_client_seq + 2 + len(b"metadata arrives later"),
+                trailing_server_seq + 2 + len(b"acknowledged"),
+                "A",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    metadata_late_payload = f"flow_id={flow_ids['metadata_after_tcp']};tcp_port=7100".encode()
+    packets.append(
+        Packet(
+            ts(3.8),
+            build_udp_packet(
+                mac("ee:ee:ee:ee:ee:ee"),
+                mac("ff:ff:ff:ff:ff:ff"),
+                "10.0.9.1",
+                "10.0.9.2",
+                5500,
+                5600,
+                metadata_late_payload,
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(3.9),
+            build_udp_packet(
+                mac("ff:ff:ff:ff:ff:ff"),
+                mac("ee:ee:ee:ee:ee:ee"),
+                "10.0.9.2",
+                "10.0.9.1",
+                5600,
+                5500,
+                b"late metadata ack",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    # --- Flow where metadata references the server-side TCP port ---
+    server_ref_client_mac = mac("11:22:33:44:55:66")
+    server_ref_server_mac = mac("66:55:44:33:22:11")
+    server_ref_client_seq = 3000
+    server_ref_server_seq = 6000
+
+    packets.append(
+        Packet(
+            ts(5.0),
+            build_udp_packet(
+                server_ref_client_mac,
+                server_ref_server_mac,
+                "10.0.3.10",
+                "10.0.3.20",
+                6100,
+                6200,
+                b"regular udp chatter",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(5.1),
+            build_tcp_packet(
+                server_ref_client_mac,
+                server_ref_server_mac,
+                "10.0.3.10",
+                "10.0.3.20",
+                8100,
+                8300,
+                server_ref_client_seq,
+                0,
+                "S",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(5.15),
+            build_tcp_packet(
+                server_ref_server_mac,
+                server_ref_client_mac,
+                "10.0.3.20",
+                "10.0.3.10",
+                8300,
+                8100,
+                server_ref_server_seq,
+                server_ref_client_seq + 1,
+                "SA",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(5.2),
+            build_tcp_packet(
+                server_ref_client_mac,
+                server_ref_server_mac,
+                "10.0.3.10",
+                "10.0.3.20",
+                8100,
+                8300,
+                server_ref_client_seq + 1,
+                server_ref_server_seq + 1,
+                "A",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(5.3),
+            build_tcp_packet(
+                server_ref_client_mac,
+                server_ref_server_mac,
+                "10.0.3.10",
+                "10.0.3.20",
+                8100,
+                8300,
+                server_ref_client_seq + 1,
+                server_ref_server_seq + 1,
+                "PA",
+                b"client payload",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    metadata_server_port = f"flow_id={flow_ids['server_port_metadata']};tcp_port=8300".encode()
+    packets.append(
+        Packet(
+            ts(5.35),
+            build_udp_packet(
+                mac("22:33:44:55:66:77"),
+                mac("33:44:55:66:77:88"),
+                "10.0.8.1",
+                "10.0.8.2",
+                6200,
+                6201,
+                metadata_server_port,
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(5.4),
+            build_tcp_packet(
+                server_ref_server_mac,
+                server_ref_client_mac,
+                "10.0.3.20",
+                "10.0.3.10",
+                8300,
+                8100,
+                server_ref_server_seq + 1,
+                server_ref_client_seq + 1 + len(b"client payload"),
+                "PA",
+                b"server payload",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(5.45),
+            build_tcp_packet(
+                server_ref_client_mac,
+                server_ref_server_mac,
+                "10.0.3.10",
+                "10.0.3.20",
+                8100,
+                8300,
+                server_ref_client_seq + 1 + len(b"client payload"),
+                server_ref_server_seq + 1 + len(b"server payload"),
+                "FA",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(5.5),
+            build_tcp_packet(
+                server_ref_server_mac,
+                server_ref_client_mac,
+                "10.0.3.20",
+                "10.0.3.10",
+                8300,
+                8100,
+                server_ref_server_seq + 1 + len(b"server payload"),
+                server_ref_client_seq + 2 + len(b"client payload"),
+                "FA",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(5.55),
+            build_tcp_packet(
+                server_ref_client_mac,
+                server_ref_server_mac,
+                "10.0.3.10",
+                "10.0.3.20",
+                8100,
+                8300,
+                server_ref_client_seq + 2 + len(b"client payload"),
+                server_ref_server_seq + 2 + len(b"server payload"),
+                "A",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    # --- Metadata that omits the TCP port ---
+    metadata_udp_only = f"flow_id={flow_ids['udp_only']}".encode()
+    packets.append(
+        Packet(
+            ts(6.0),
+            build_udp_packet(
+                mac("44:55:66:77:88:99"),
+                mac("99:88:77:66:55:44"),
+                "10.0.4.1",
+                "10.0.4.2",
+                6300,
+                6400,
+                metadata_udp_only,
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(6.05),
+            build_udp_packet(
+                mac("99:88:77:66:55:44"),
+                mac("44:55:66:77:88:99"),
+                "10.0.4.2",
+                "10.0.4.1",
+                6400,
+                6300,
+                b"udp echo",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(6.1),
+            build_udp_packet(
+                mac("44:55:66:77:88:99"),
+                mac("99:88:77:66:55:44"),
+                "10.0.4.1",
+                "10.0.4.2",
+                6300,
+                6400,
+                b"metadata-free follow-up",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    # --- Background noise ---
+    packets.append(
+        Packet(
+            ts(6.5),
+            build_udp_packet(
+                mac("ab:ab:ab:ab:ab:ab"),
+                mac("cd:cd:cd:cd:cd:cd"),
+                "10.0.5.1",
+                "10.0.5.2",
+                1111,
+                2222,
+                b"background udp",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(6.6),
+            build_tcp_packet(
+                mac("de:ad:be:ef:00:01"),
+                mac("de:ad:be:ef:00:02"),
+                "10.0.6.1",
+                "10.0.6.2",
+                6500,
+                6501,
+                4000,
+                0,
+                "S",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    packets.append(
+        Packet(
+            ts(6.65),
+            build_tcp_packet(
+                mac("de:ad:be:ef:00:02"),
+                mac("de:ad:be:ef:00:01"),
+                "10.0.6.2",
+                "10.0.6.1",
+                6501,
+                6500,
+                8000,
+                4001,
+                "RA",
+                b"",
+                identification=next_id(),
+            ),
+        )
+    )
+
+    return packets, flow_ids
 
 
 def main() -> None:
@@ -458,10 +927,11 @@ def main() -> None:
     parser.add_argument("output", nargs="?", default="sample_flows.pcap", help="Path to the output PCAP file")
     args = parser.parse_args()
 
-    flow_id = uuid.uuid4()
-    packets = build_packets(flow_id)
+    packets, flow_ids = build_packets()
     packet_list_to_bytes(packets, args.output)
-    print(f"Wrote {len(packets)} packets to {args.output} with flow_id={flow_id}")
+    print(f"Wrote {len(packets)} packets to {args.output}")
+    for name, value in flow_ids.items():
+        print(f"  {name}: {value}")
 
 
 if __name__ == "__main__":
