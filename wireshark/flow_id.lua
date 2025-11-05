@@ -28,6 +28,34 @@ local data_field = Field.new("data.data")
 local udp_sessions = {}
 local tcp_sessions = {}
 local tcp_port_map = {}
+local pending_tcp_sessions = {}
+
+local function track_pending_tcp_session(port, session_key)
+    if not port then
+        return
+    end
+
+    if not pending_tcp_sessions[port] then
+        pending_tcp_sessions[port] = {}
+    end
+    pending_tcp_sessions[port][session_key] = true
+end
+
+local function resolve_pending_tcp_sessions(port, flow_id)
+    if not port then
+        return
+    end
+
+    local sessions = pending_tcp_sessions[port]
+    if not sessions then
+        return
+    end
+
+    for session_key, _ in pairs(sessions) do
+        tcp_sessions[session_key] = flow_id
+    end
+    pending_tcp_sessions[port] = nil
+end
 
 local function normalise_session(proto, src, sport, dst, dport)
     local addr_a = tostring(src)
@@ -89,6 +117,7 @@ function flow_proto.dissector(tvb, pinfo, tree)
                 udp_sessions[session_key] = parsed_id
                 if tcp_port then
                     tcp_port_map[tcp_port] = parsed_id
+                    resolve_pending_tcp_sessions(tcp_port, parsed_id)
                 end
             end
         end
@@ -103,12 +132,21 @@ function flow_proto.dissector(tvb, pinfo, tree)
             if src_port and tcp_port_map[src_port] then
                 flow_id = tcp_port_map[src_port]
                 source = "tcp port map"
+                resolve_pending_tcp_sessions(src_port, flow_id)
             elseif dst_port and tcp_port_map[dst_port] then
                 flow_id = tcp_port_map[dst_port]
                 source = "tcp port map"
+                resolve_pending_tcp_sessions(dst_port, flow_id)
             end
             if flow_id then
                 tcp_sessions[session_key] = flow_id
+            else
+                if src_port then
+                    track_pending_tcp_session(src_port, session_key)
+                end
+                if dst_port then
+                    track_pending_tcp_session(dst_port, session_key)
+                end
             end
         end
     end
