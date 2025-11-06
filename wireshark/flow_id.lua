@@ -29,6 +29,25 @@ local udp_sessions = {}
 local tcp_sessions = {}
 local tcp_port_map = {}
 
+local function shell_escape(str)
+    local value = tostring(str or "")
+    return "'" .. value:gsub("'", "'\"'\"'") .. "'"
+end
+
+local function get_python_script_path()
+    local info = debug.getinfo(get_python_script_path, "S")
+    if info and info.source and info.source:sub(1, 1) == "@" then
+        local source_path = info.source:sub(2)
+        local directory = source_path:match("(.*[/\\])")
+        if directory then
+            return directory .. "../scripts/parse_metadata.py"
+        end
+    end
+    return "scripts/parse_metadata.py"
+end
+
+local python_script_path = get_python_script_path()
+
 local function normalise_session(proto, src, sport, dst, dport)
     local addr_a = tostring(src)
     local addr_b = tostring(dst)
@@ -55,14 +74,32 @@ local function parse_metadata(payload)
         return nil, nil
     end
 
-    local flow_id = payload:match("flow_id=([%w%-]+)")
-    if not flow_id then
+    local command = string.format("python3 %s %s", shell_escape(python_script_path), shell_escape(payload))
+    local handle = io.popen(command)
+    if not handle then
         return nil, nil
     end
 
-    local tcp_port = payload:match("tcp_port=(%d+)")
-    if tcp_port then
-        tcp_port = tonumber(tcp_port)
+    local output = handle:read("*a") or ""
+    handle:close()
+
+    local flow_id_line, tcp_port_line = output:match("^([^\n]*)\n([^\n]*)")
+    if not flow_id_line then
+        flow_id_line = output:match("^([^\n]*)") or ""
+        tcp_port_line = ""
+    end
+
+    flow_id_line = flow_id_line:match("^%s*(.-)%s*$") or ""
+    tcp_port_line = tcp_port_line:match("^%s*(.-)%s*$") or ""
+
+    if flow_id_line == "" then
+        return nil, nil
+    end
+
+    local flow_id = flow_id_line
+    local tcp_port = nil
+    if tcp_port_line ~= "" then
+        tcp_port = tonumber(tcp_port_line)
     end
 
     return flow_id, tcp_port
