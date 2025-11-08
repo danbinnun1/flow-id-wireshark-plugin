@@ -1,168 +1,109 @@
--- Flow ID tracking post-dissector for Wireshark
---
--- This plugin inspects UDP packets for metadata messages that contain a
--- flow identifier and the TCP port associated with the same logical flow.
--- The discovered mapping is then applied to every packet that belongs to the
--- corresponding UDP or TCP session and exposed through a custom protocol
--- field (flowid.id). The field can be promoted to a column in Wireshark to
--- visualise the flow identifier directly in the packet list. When no custom
--- column is configured the plugin appends the identifier to the Info column
--- so the association is still visible during analysis.
---
--- Metadata payload format (ASCII):
---   flow_id=<uuid>;tcp_port=<port>
--- Additional key/value pairs are ignored. Only the flow identifier is
--- required; the TCP port is optional but enables the plugin to associate the
--- corresponding TCP stream automatically.
+-- Flow ID tracking (batch once; LUA passes hex like "220a567b...")
 
-local flow_proto = Proto("flowid", "Flow ID Tracker")
+local flow_proto  = Proto("flowid", "Flow ID Tracker")
+local flow_field  = ProtoField.string("flowid.id", "Flow ID")
+flow_proto.fields = { flow_field }
 
-local flow_field = ProtoField.string("flowid.id", "Flow ID")
-local source_field = ProtoField.string("flowid.source", "Flow Source")
-flow_proto.fields = { flow_field, source_field }
+local f_udp  = Field.new("udp")
+local f_tcp  = Field.new("tcp")
+local f_data = Field.new("data.data")
+local udp_tap = Listener.new("udp")
 
-local udp_field = Field.new("udp")
-local tcp_field = Field.new("tcp")
-local data_field = Field.new("data.data")
+-- state
+local ready = false
+local items = {}            -- { {hex=..., us=udp_src_port, ud=udp_dst_port}, ... }
+local udp_map, tcp_map = {}, {}
 
-local udp_sessions = {}
-local tcp_sessions = {}
-local tcp_port_map = {}
+local function nport(p) return tonumber(tostring(p)) or 0 end
 
-local function shell_escape(str)
-    local value = tostring(str or "")
-    return "'" .. value:gsub("'", "'\"'\"'") .. "'"
+-- fast bytearray → hex (lowercase)
+local function bytes_to_hex(ba)
+  local n = ba:len()
+  local out = {}
+  for i = 0, n - 1 do
+    out[#out + 1] = string.format("%02x", ba:get_index(i))
+  end
+  return table.concat(out)
 end
 
-local function get_python_script_path()
-    local info = debug.getinfo(get_python_script_path, "S")
-    if info and info.source and info.source:sub(1, 1) == "@" then
-        local source_path = info.source:sub(2)
-        local directory = source_path:match("(.*[/\\])")
-        if directory then
-            return directory .. "../scripts/parse_metadata.py"
-        end
+-- run python ONCE: input has one HEX line per payload; output "flow_id \t tcp_port"
+local function run_python_once(recs)
+  local inpath, outpath = os.tmpname(), os.tmpname()
+
+  -- write hex lines (same order as recs)
+  local f = assert(io.open(inpath, "wb"))
+  for i = 1, #recs do f:write(recs[i].hex, "\n") end
+  f:close()
+
+  print(inpath)
+  -- adjust python path/flags to your env
+  os.execute(
+    [[python -S -u "C:\Users\danbi\flow-id-wireshark-plugin\wireshark\parse_metadata_batch.py" "]]..inpath..[[" "]]..outpath..[["]]
+  )
+
+
+  -- read results back in the SAME order; pair with stored UDP ports
+  local r = assert(io.open(outpath, "rb"))
+  local i = 1
+  for line in r:lines() do
+    local flow_id, tcp_port = line:match("^([%w%-]+)%s*\t%s*(%d*)%s*$")
+    local it = recs[i]
+    if flow_id and it then
+      if it.us and it.us > 0 then udp_map[it.us] = flow_id end
+      if it.ud and it.ud > 0 then udp_map[it.ud] = flow_id end
+      if tcp_port and #tcp_port > 0 then tcp_map[tonumber(tcp_port)] = flow_id end
     end
-    return "scripts/parse_metadata.py"
+    i = i + 1
+  end
+  r:close()
+
+  ready = true
 end
 
-local python_script_path = get_python_script_path()
-
-local function normalise_session(proto, src, sport, dst, dport)
-    local addr_a = tostring(src)
-    local addr_b = tostring(dst)
-    local port_a = tonumber(tostring(sport)) or 0
-    local port_b = tonumber(tostring(dport)) or 0
-
-    if addr_a > addr_b or (addr_a == addr_b and port_a > port_b) then
-        addr_a, addr_b = addr_b, addr_a
-        port_a, port_b = port_b, port_a
-    end
-
-    return string.format("%s:%s:%d-%s:%d", proto, addr_a, port_a, addr_b, port_b)
+-- collect UDP payloads + ports during first pass
+function udp_tap.packet(pinfo, tvb)
+  if ready then return end
+  local d = f_data()
+  if not d then return end
+  local r  = d.range
+  local ba = r:bytes()
+  items[#items + 1] = {
+    hex = bytes_to_hex(ba),
+    us  = nport(pinfo.src_port),
+    ud  = nport(pinfo.dst_port),
+  }
 end
 
-local function bytearray_to_string(bytearray)
-    if not bytearray then
-        return nil
-    end
-    return bytearray:raw(0, bytearray:len())
+function udp_tap.draw()
+  if not ready and #items > 0 then
+    run_python_once(items)
+    retap_packets()
+  end
 end
 
-local function parse_metadata(payload)
-    if not payload or payload == "" then
-        return nil, nil
-    end
-
-    local command = string.format("python3 %s %s", shell_escape(python_script_path), shell_escape(payload))
-    local handle = io.popen(command)
-    if not handle then
-        return nil, nil
-    end
-
-    local output = handle:read("*a") or ""
-    handle:close()
-
-    local flow_id_line, tcp_port_line = output:match("^([^\n]*)\n([^\n]*)")
-    if not flow_id_line then
-        flow_id_line = output:match("^([^\n]*)") or ""
-        tcp_port_line = ""
-    end
-
-    flow_id_line = flow_id_line:match("^%s*(.-)%s*$") or ""
-    tcp_port_line = tcp_port_line:match("^%s*(.-)%s*$") or ""
-
-    if flow_id_line == "" then
-        return nil, nil
-    end
-
-    local flow_id = flow_id_line
-    local tcp_port = nil
-    if tcp_port_line ~= "" then
-        tcp_port = tonumber(tcp_port_line)
-    end
-
-    return flow_id, tcp_port
+function flow_proto.init()
+  ready = false
+  items = {}
+  udp_map, tcp_map = {}, {}
 end
 
+-- post-dissector: read only from caches (fast)
 function flow_proto.dissector(tvb, pinfo, tree)
-    local flow_id = nil
-    local source = nil
-
-    if udp_field() then
-        local session_key = normalise_session("udp", pinfo.src, pinfo.src_port, pinfo.dst, pinfo.dst_port)
-        flow_id = udp_sessions[session_key]
-        if flow_id then
-            source = "udp session cache"
-        end
-
-        local data_info = data_field()
-        if data_info then
-            local payload = bytearray_to_string(data_info.range:bytes())
-            local parsed_id, tcp_port = parse_metadata(payload)
-            if parsed_id then
-                flow_id = parsed_id
-                source = "udp metadata"
-                udp_sessions[session_key] = parsed_id
-                if tcp_port then
-                    tcp_port_map[tcp_port] = parsed_id
-                end
-            end
-        end
-    elseif tcp_field() then
-        local session_key = normalise_session("tcp", pinfo.src, pinfo.src_port, pinfo.dst, pinfo.dst_port)
-        flow_id = tcp_sessions[session_key]
-        if flow_id then
-            source = "tcp session cache"
-        else
-            local src_port = tonumber(tostring(pinfo.src_port))
-            local dst_port = tonumber(tostring(pinfo.dst_port))
-            if src_port and tcp_port_map[src_port] then
-                flow_id = tcp_port_map[src_port]
-                source = "tcp port map"
-            elseif dst_port and tcp_port_map[dst_port] then
-                flow_id = tcp_port_map[dst_port]
-                source = "tcp port map"
-            end
-            if flow_id then
-                tcp_sessions[session_key] = flow_id
-            end
-        end
+  if not ready then return end
+  local flow_id
+  if f_udp() then
+    local sp, dp = nport(pinfo.src_port), nport(pinfo.dst_port)
+    flow_id = udp_map[sp] or udp_map[dp]
+  elseif f_tcp() then
+    local sp, dp = nport(pinfo.src_port), nport(pinfo.dst_port)
+    flow_id = tcp_map[sp] or tcp_map[dp]
+  end
+  if flow_id then
+    tree:add(flow_proto, "Flow Association"):add(flow_field, flow_id)
+    if pinfo.cols and pinfo.cols.info then
+      pinfo.cols.info:append(" [flow_id:" .. flow_id .. "]")
     end
-
-    if flow_id then
-        local subtree = tree:add(flow_proto, "Flow Association")
-        subtree:add(flow_field, flow_id)
-        if source then
-            subtree:add(source_field, source)
-        end
-
-        if pinfo.cols.custom then
-            pinfo.cols.custom:set(flow_id)
-        elseif pinfo.cols.info then
-            pinfo.cols.info:append(" [flow_id:" .. flow_id .. "]")
-        end
-    end
+  end
 end
 
 register_postdissector(flow_proto)
